@@ -31,6 +31,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     count_pool_hits,
 )
+from sglang.srt.observability.mooncake_trace import MooncakeRequestStage
+from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -261,6 +263,7 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        trace_ctx: Optional[TraceReqContext] = None,
     ):
         self.request_id = request_id
 
@@ -268,6 +271,11 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        # Optional propagate-only handle: kept as a reference so prefetch I/O
+        # threads can rebuild thread context and stamp correlation tags onto
+        # remote-storage RPC logs. Never pickled, never mutated from the
+        # producer side; TraceNullContext() is used when tracing is disabled.
+        self.trace_ctx = trace_ctx if trace_ctx is not None else TraceNullContext()
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -323,6 +331,10 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        # Only the mooncake backend understands the optional trace_ctx kwarg
+        # on batch_exists/batch_get_v1; gate it so other backends (hf3fs,
+        # simm, nixl, eic...) continue to get called with positional args.
+        self.enable_storage_trace = storage_backend == "mooncake"
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
@@ -544,6 +556,9 @@ class HiCacheController:
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
         self.storage_backend_type = storage_backend
+        # Only the mooncake backend understands the optional trace_ctx kwarg
+        # on batch_exists/batch_get_v1; other backends keep positional calls.
+        self.enable_storage_trace = storage_backend == "mooncake"
         from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
@@ -967,12 +982,24 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        trace_ctx=None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
+
+        ``trace_ctx`` is an optional trace context propagated from the
+        producer (the scheduler); it is forwarded unchanged onto the
+        PrefetchOperation so the prefetch worker thread can rebuild a
+        thread-local copy and emit a linked OTel span for the storage I/O
+        stage. Default is None, which becomes TraceNullContext() and is a
+        no-op for the tracing pipeline.
         """
         operation = PrefetchOperation(
-            request_id, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            trace_ctx=trace_ctx,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -999,9 +1026,19 @@ class HiCacheController:
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
-        results = self.storage_backend.batch_get_v1(
-            hash_values, host_indices, extra_info
-        )
+        if self.enable_storage_trace:
+            # Only the mooncake backend accepts the optional trace_ctx kwarg;
+            # other backends are called positionally (see enable_storage_trace).
+            results = self.storage_backend.batch_get_v1(
+                hash_values,
+                host_indices,
+                extra_info,
+                trace_ctx=operation.trace_ctx,
+            )
+        else:
+            results = self.storage_backend.batch_get_v1(
+                hash_values, host_indices, extra_info
+            )
         inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
@@ -1132,7 +1169,24 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_transfer(operation)
+                trace_ctx = operation.trace_ctx
+                enabled = trace_ctx.tracing_enable
+                if enabled:
+                    # The fetch (batch_get_v1) runs in this aux thread, not the
+                    # hit-query thread; rebuild the ctx here before the slice.
+                    trace_ctx.rebuild_thread_context()
+                    trace_ctx.trace_slice_start(
+                        MooncakeRequestStage.HICACHE_MOONCAKE_FETCH.stage_name,
+                        MooncakeRequestStage.HICACHE_MOONCAKE_FETCH.level,
+                    )
+                try:
+                    self._page_transfer(operation)
+                finally:
+                    if enabled:
+                        trace_ctx.trace_slice_end(
+                            MooncakeRequestStage.HICACHE_MOONCAKE_FETCH.stage_name,
+                            MooncakeRequestStage.HICACHE_MOONCAKE_FETCH.level,
+                        )
 
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
@@ -1179,7 +1233,16 @@ class HiCacheController:
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            if self.enable_storage_trace:
+                hit_page_num = self.storage_backend.batch_exists(
+                    batch_hashes,
+                    extra_info,
+                    trace_ctx=operation.trace_ctx,
+                )
+            else:
+                hit_page_num = self.storage_backend.batch_exists(
+                    batch_hashes, extra_info
+                )
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -1198,10 +1261,31 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                if operation.is_terminated():
-                    hash_value, storage_hit_count = [], 0
-                else:
-                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+                # The prefetch op carries a thread-local copy of the request's
+                # trace ctx (see scheduler._prefetch_kvcache). Rebuild it in
+                # this worker thread and open the storage-hit-probe slice; the
+                # disabled / null context is a no-op for every call below.
+                trace_ctx = operation.trace_ctx
+                enabled = trace_ctx.tracing_enable
+                if enabled:
+                    trace_ctx.rebuild_thread_context()
+                    trace_ctx.trace_slice_start(
+                        MooncakeRequestStage.HICACHE_STORAGE_HIT_QUERY.stage_name,
+                        MooncakeRequestStage.HICACHE_STORAGE_HIT_QUERY.level,
+                    )
+                try:
+                    if operation.is_terminated():
+                        hash_value, storage_hit_count = [], 0
+                    else:
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                finally:
+                    if enabled:
+                        trace_ctx.trace_slice_end(
+                            MooncakeRequestStage.HICACHE_STORAGE_HIT_QUERY.stage_name,
+                            MooncakeRequestStage.HICACHE_STORAGE_HIT_QUERY.level,
+                        )
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
@@ -1212,7 +1296,7 @@ class HiCacheController:
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
-                # Record the TP-synced hit count; the scheduler thread decides
+                # Record the TP-synced hit count; the scheduler decides
                 # at drain time whether to revoke (below threshold) or allocate.
                 operation.hash_value = hash_value[
                     : (storage_hit_count // self.page_size)

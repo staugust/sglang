@@ -1701,6 +1701,11 @@ class UnifiedRadixCache(BasePrefixCache):
         matched_prefix_tokens: Optional[list[int]] = None,
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        # Accepted for signature parity with HiRadixCache.prefetch_from_storage
+        # so the scheduler can call both tree caches uniformly. The hybrid
+        # recall goes through the v2 storage path, which is not wired for
+        # per-request tracing; the ctx is intentionally not propagated here.
+        trace_ctx=None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
             return

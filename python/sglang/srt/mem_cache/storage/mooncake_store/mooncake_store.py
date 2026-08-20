@@ -24,10 +24,31 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.observability.trace import TraceReqContext
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 DEFAULT_TENANT_ID = "default"
+
+
+def _trace_tag(trace_ctx) -> str:
+    """Short, greppable trace id for remote-storage logs.
+
+    Returns "-" when tracing is disabled or no slice has ended yet, so every
+    storage call is greppable by `trace=` even with tracing off. The id comes
+    from ``last_span_context`` (a real opentelemetry SpanContext); the request
+    root_span_context is an opaque otel Context and carries no ``trace_id``.
+    """
+    if not isinstance(trace_ctx, TraceReqContext):
+        return "-"
+    span_ctx = trace_ctx.last_span_context
+    if span_ctx is None:
+        return "-"
+    trace_id = span_ctx.trace_id
+    if isinstance(trace_id, int):
+        return format(trace_id, "032x")
+    return str(trace_id)[:64]
+
 
 logger = logging.getLogger(__name__)
 
@@ -898,7 +919,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
-        # storage objects per logical page, but API still reports page-level result.
+        # storage objects per logical-key, but API still reports page-level result.
         results: dict = {}
         for transfer in transfers:
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
@@ -1068,15 +1089,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys: List[str],
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        trace_ctx=None,
     ) -> List[bool]:
         if self.mem_pool_host.kv_buffer is None:
-            # DeepSeek V4's KV anchor is logical only; v2 side pools carry data.
+            # DeepSeek V4's KV anchor is logical-only; v2 side pools carry data.
             return [True] * len(keys)
 
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+
+        trace = _trace_tag(trace_ctx)
+        first_key = key_strs[0] if key_strs else "<empty>"
+        logger.info(
+            "[hicache.batch_get_v1] trace=%s n_keys=%d bytes=%d first_key=%s",
+            trace,
+            len(key_strs),
+            sum(buffer_sizes) if buffer_sizes else 0,
+            first_key,
+        )
 
         start_time = time.perf_counter()
         get_results = self._get_batch_zero_copy_impl(
@@ -1089,6 +1121,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.prefetch_bandwidth.append(
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
+
+        logger.info(
+            "[hicache.batch_get_v1] trace=%s done n_keys=%d latency_ms=%.2f",
+            trace,
+            len(get_results),
+            (end_time - start_time) * 1000,
+        )
 
         return self._batch_postprocess(get_results, is_set_operate=False)
 
@@ -1274,10 +1313,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return exist_result[0] == 1
 
     def batch_exists(
-        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+        self,
+        keys,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        trace_ctx=None,
     ) -> int:
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
+
+        trace = _trace_tag(trace_ctx)
+        first_key = keys[0] if keys else "<empty>"
+        logger.info(
+            "[hicache.batch_exists] trace=%s n_keys=%d first_key=%s",
+            trace,
+            len(keys),
+            first_key,
+        )
 
         if self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]

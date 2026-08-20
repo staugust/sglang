@@ -3059,6 +3059,10 @@ class Scheduler(
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
+                    # Pass a thread-local copy, not the request's live ctx:
+                    # prefetch worker threads rebuild + slice on it concurrently
+                    # with the scheduler's own tracing of this in-flight req.
+                    trace_ctx=req.time_stats.trace_ctx.copy_for_thread(),
                 )
 
     def _retry_missed_storage_prefetches(self):

@@ -1777,6 +1777,10 @@ class HiRadixCache(RadixCache):
         # so the namespace is already carried by ``last_host_node.key``.
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        # Optional trace context injected by the scheduler; forwarded
+        # unchanged onto the prefetch operation so the storage I/O thread
+        # can rebuild a thread-local copy and link its spans to the request.
+        trace_ctx=None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,
@@ -1803,6 +1807,7 @@ class HiRadixCache(RadixCache):
             prefetch_key,
             last_hash,
             prefix_keys,
+            trace_ctx=trace_ctx,
             **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (
