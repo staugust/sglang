@@ -1702,9 +1702,11 @@ class UnifiedRadixCache(BasePrefixCache):
         extra_key: Optional[str] = None,
         cache_salt: Optional[str] = None,
         # Accepted for signature parity with HiRadixCache.prefetch_from_storage
-        # so the scheduler can call both tree caches uniformly. The hybrid
-        # recall goes through the v2 storage path, which is not wired for
-        # per-request tracing; the ctx is intentionally not propagated here.
+        # so the scheduler can call both tree caches uniformly. Forwarded onto
+        # the HybridCacheController prefetch op; its hit-probe goes through
+        # batch_exists_v2 (the v2 storage path, not wired for per-request
+        # tracing), while the fetch goes through batch_get_v1 and carries the
+        # trace tag. TraceNullContext() keeps disabled tracing a no-op.
         trace_ctx=None,
     ) -> None:
         if not self.enable_storage or self.cache_controller is None:
@@ -1815,6 +1817,7 @@ class UnifiedRadixCache(BasePrefixCache):
             last_hash,
             prefix_keys,
             extra_pools=aux_xfers or None,
+            trace_ctx=trace_ctx,
         )
         stats["issued"] += 1
         # Snapshot the requested span for L3 miss-token accounting at the

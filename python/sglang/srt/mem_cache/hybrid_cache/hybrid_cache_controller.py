@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -65,12 +66,20 @@ class PrefetchOperation(StorageOperation):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         pool_transfers: Optional[list[PoolTransfer]] = None,
+        trace_ctx: Optional[TraceReqContext] = None,
     ):
         self.request_id = request_id
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        # Propagate-only handle; the prefetch I/O worker threads rebuild a
+        # thread-local copy and stamp correlation tags onto remote-storage
+        # RPC logs. TraceNullContext() makes disabled tracing a no-op,
+        # mirroring HiCacheController.PrefetchOperation so the inherited
+        # workers (prefetch_thread_func / prefetch_io_aux_func) can read
+        # operation.trace_ctx unconditionally without AttributeError.
+        self.trace_ctx = trace_ctx if trace_ctx is not None else TraceNullContext()
         super().__init__(
             None,
             token_ids,
@@ -546,6 +555,7 @@ class HybridCacheController(BaseHiCacheController):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        trace_ctx: Optional[TraceReqContext] = None,
     ) -> PrefetchOperation:
         operation = PrefetchOperation(
             request_id,
@@ -553,6 +563,7 @@ class HybridCacheController(BaseHiCacheController):
             last_hash,
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
+            trace_ctx=trace_ctx,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -589,7 +600,12 @@ class HybridCacheController(BaseHiCacheController):
                 hash_value, operation.pool_transfers, extra_info
             )
         else:
-            kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
+            if self.enable_storage_trace:
+                kv_hit_count = self.storage_backend.batch_exists(
+                    hash_value, extra_info, trace_ctx=operation.trace_ctx
+                )
+            else:
+                kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
             hit_result = PoolTransferResult(
                 kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
             )
