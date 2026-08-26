@@ -818,6 +818,18 @@ class TraceReqContext:
             self.thread_context.thread_span.end(end_time=ts)
         self.thread_context = None
 
+    def release_thread_context(self, ts: Optional[int] = None):
+        """End this context's thread_span without an abort status.
+
+        A trace ctx returned by ``copy_for_thread`` has ``root_span`` set to None, so the
+        parent thread's ``trace_req_finish`` (which closes the root span) is a no-op for
+        it; the thread_span it builds on a worker thread via
+        ``rebuild_thread_context`` must therefore be closed where it was created.
+        Equivalent to ``abort(ts=ts)`` without ``abort_info``: it ends any leftover
+        slices, the thread_span, and clears thread_context, without setting an error.
+        """
+        self.abort(ts=ts)
+
     def flush(self):
         pass
 

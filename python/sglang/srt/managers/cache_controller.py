@@ -32,7 +32,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     count_pool_hits,
 )
 from sglang.srt.observability.mooncake_trace import MooncakeRequestStage
-from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
+from sglang.srt.observability.trace import (
+    TraceNullContext,
+    TraceReqContext,
+    trace_set_thread_info,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -44,7 +48,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_observability, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -444,6 +448,26 @@ class HiCacheController:
     ) -> None:
         for group in groups:
             torch.distributed.all_reduce(tensor, op=op, group=group)
+
+    def _register_cache_thread(self, thread_label: str):
+        """Register the current worker thread for tracing.
+
+        Mirrors the Scheduler setup in scheduler.run_scheduler_process: every
+        cache_controller worker thread that calls trace_ctx.rebuild_thread_context()
+        must register itself at thread entry, so __create_thread_context names its
+        thread_span after ``thread_label`` (e.g. "HiCache Prefetch ...") instead of
+        falling back to ``"unknown"``.
+        """
+        if not get_observability().enable_trace:
+            return
+        if is_dp_attention_enabled():
+            tp_rank = get_parallel().attn_tp_rank
+            dp_rank = get_attention_dp_rank()
+        else:
+            tp_rank = get_parallel().tp_rank
+            dp_rank = 0
+        pp_rank = get_parallel().pp_rank
+        trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -1164,6 +1188,7 @@ class HiCacheController:
         """
         Auxiliary function conducting IO operations for prefetching.
         """
+        self._register_cache_thread("HiCache Prefetch Aux")
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
@@ -1187,6 +1212,7 @@ class HiCacheController:
                             MooncakeRequestStage.HICACHE_MOONCAKE_FETCH.stage_name,
                             MooncakeRequestStage.HICACHE_MOONCAKE_FETCH.level,
                         )
+                        trace_ctx.release_thread_context()
 
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
@@ -1256,6 +1282,7 @@ class HiCacheController:
         """
         Manage prefetching operations from storage backend to host memory.
         """
+        self._register_cache_thread("HiCache Prefetch")
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
@@ -1286,6 +1313,7 @@ class HiCacheController:
                             MooncakeRequestStage.HICACHE_STORAGE_HIT_QUERY.stage_name,
                             MooncakeRequestStage.HICACHE_STORAGE_HIT_QUERY.level,
                         )
+                        trace_ctx.release_thread_context()
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
