@@ -1196,17 +1196,17 @@ class HiCacheController:
                     continue
                 trace_ctx = operation.trace_ctx
                 fetch_stage = MooncakeRequestStage.HICACHE_MOONCAKE_FETCH
-                # Skip the whole thread span + slice when the fetch slice would
-                # be fast-returned (level > trace_level), so no empty
-                # "HiCache Prefetch Aux" thread span is left with no child slice.
+                # Skip the whole trace + slice when the fetch slice would be
+                # fast-returned (level > trace_level), so no empty
+                # "HiCache Prefetch Aux" trace is left with no child slice.
                 enabled = (
                     trace_ctx.tracing_enable
                     and fetch_stage.level <= trace_ctx.trace_level
                 )
                 if enabled:
                     # The fetch (batch_get_v1) runs in this aux thread, not the
-                    # hit-query thread; rebuild the ctx here before the slice.
-                    trace_ctx.rebuild_thread_context()
+                    # hit-query thread; start the hicache trace here before the slice.
+                    trace_ctx.trace_req_start()
                     trace_ctx.trace_slice_start(
                         fetch_stage.stage_name,
                         fetch_stage.level,
@@ -1219,7 +1219,7 @@ class HiCacheController:
                             fetch_stage.stage_name,
                             fetch_stage.level,
                         )
-                        trace_ctx.release_thread_context()
+                        trace_ctx.trace_req_finish()
 
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
@@ -1295,21 +1295,22 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                # The prefetch op carries a thread-local copy of the request's
-                # trace ctx (see scheduler._prefetch_kvcache). Rebuild it in
-                # this worker thread and open the storage-hit-probe slice; the
-                # disabled / null context is a no-op for every call below.
+                # The prefetch op carries an independent hicache trace ctx (see
+                # scheduler._prefetch_kvcache / create_hicache_trace_ctx). Start
+                # its root span here on this worker thread and open the
+                # storage-hit-probe slice; the disabled / null context is a
+                # no-op for every call below.
                 trace_ctx = operation.trace_ctx
                 hit_query_stage = MooncakeRequestStage.HICACHE_STORAGE_HIT_QUERY
-                # Skip the whole thread span + slice when the hit-probe slice
-                # would be fast-returned (level > trace_level), so no empty
-                # "HiCache Prefetch" thread span is left with no child slice.
+                # Skip the whole trace + slice when the hit-probe slice would
+                # be fast-returned (level > trace_level), so no empty "HiCache
+                # Prefetch" trace is left with no child slice.
                 enabled = (
                     trace_ctx.tracing_enable
                     and hit_query_stage.level <= trace_ctx.trace_level
                 )
                 if enabled:
-                    trace_ctx.rebuild_thread_context()
+                    trace_ctx.trace_req_start()
                     trace_ctx.trace_slice_start(
                         hit_query_stage.stage_name,
                         hit_query_stage.level,
@@ -1327,7 +1328,7 @@ class HiCacheController:
                             hit_query_stage.stage_name,
                             hit_query_stage.level,
                         )
-                        trace_ctx.release_thread_context()
+                        trace_ctx.trace_req_finish()
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )

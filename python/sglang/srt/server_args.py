@@ -1607,7 +1607,7 @@ class ServerArgs:
     enable_trace: A[bool, "Enable opentelemetry trace", NS("observability")] = False
     trace_modules: A[
         str,
-        "Select the components to trace. Available options are 'request' and 'mooncake'. Format: <module1 name>,<module2 name>,...",
+        "Select the components to trace. Available options are 'request', 'mooncake', and 'hicache'. Format: <module1 name>,<module2 name>,...",
         NS("observability"),
     ] = "request"
     otlp_traces_endpoint: A[

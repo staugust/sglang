@@ -293,7 +293,11 @@ from sglang.srt.observability.req_time_stats import (
     set_time_batch,
 )
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.observability.trace import (
+    create_hicache_trace_ctx,
+    process_tracing_init,
+    trace_set_thread_info,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
@@ -3059,10 +3063,14 @@ class Scheduler(
                     matched_prefix_tokens=req.full_untruncated_fill_ids[:matched_len],
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
-                    # Pass a thread-local copy, not the request's live ctx:
-                    # prefetch worker threads rebuild + slice on it concurrently
-                    # with the scheduler's own tracing of this in-flight req.
-                    trace_ctx=req.time_stats.trace_ctx.copy_for_thread(),
+                    # Hand the prefetch op an independent hicache trace ctx
+                    # (module_name="hicache"); when the request is being traced,
+                    # its span context is injected so the hicache trace links
+                    # under the request's trace tree. The prefetch worker owns
+                    # the ctx lifecycle (trace_req_start/finish on its thread).
+                    trace_ctx=create_hicache_trace_ctx(
+                        req.rid, req.time_stats.trace_ctx
+                    ),
                 )
 
     def _retry_missed_storage_prefetches(self):

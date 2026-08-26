@@ -22,7 +22,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources
@@ -307,6 +307,47 @@ def trace_set_thread_info(
 
     if _on_thread_info_set is not None:
         _on_thread_info_set(threads_info[pid])
+
+
+HICACHE_TRACE_MODULE = "hicache"
+
+
+def create_hicache_trace_ctx(
+    rid: str,
+    parent_trace_ctx: Optional[TraceReqContext] = None,
+) -> Union[TraceReqContext, TraceNullContext]:
+    """Create an independent, module-filterable trace ctx for a HiCache prefetch op.
+
+    Mirrors the mooncake module pattern: a self-contained ctx tagged
+    ``module_name="hicache"`` so ``--trace-modules`` can gate it independently
+    of the request module. When ``parent_trace_ctx`` is tracing and carries a
+    root span context, that context is injected (W3C traceparent) as
+    ``external_trace_header`` so the hicache root span becomes a child of the
+    request span (same trace tree). The caller owns the lifecycle: call
+    ``trace_req_start()`` / ``trace_req_finish()`` on the worker thread that
+    processes the op.
+    """
+    external_trace_header: Optional[Dict[str, str]] = None
+    if (
+        parent_trace_ctx is not None
+        and parent_trace_ctx.tracing_enable
+        and parent_trace_ctx.root_span_context is not None
+        and _trace_context_propagator is not None
+    ):
+        external_trace_header = {}
+        _trace_context_propagator.inject(
+            external_trace_header, parent_trace_ctx.root_span_context
+        )
+
+    ctx = TraceReqContext(
+        rid=rid,
+        role="HiCache",
+        module_name=HICACHE_TRACE_MODULE,
+        external_trace_header=external_trace_header,
+    )
+    if not ctx.tracing_enable:
+        return TraceNullContext()
+    return ctx
 
 
 class TraceReqContext:
@@ -817,18 +858,6 @@ class TraceReqContext:
 
             self.thread_context.thread_span.end(end_time=ts)
         self.thread_context = None
-
-    def release_thread_context(self, ts: Optional[int] = None):
-        """End this context's thread_span without an abort status.
-
-        A trace ctx returned by ``copy_for_thread`` has ``root_span`` set to None, so the
-        parent thread's ``trace_req_finish`` (which closes the root span) is a no-op for
-        it; the thread_span it builds on a worker thread via
-        ``rebuild_thread_context`` must therefore be closed where it was created.
-        Equivalent to ``abort(ts=ts)`` without ``abort_info``: it ends any leftover
-        slices, the thread_span, and clears thread_context, without setting an error.
-        """
-        self.abort(ts=ts)
 
     def flush(self):
         pass
