@@ -32,13 +32,16 @@ class MooncakeRequestStage:
     # HiCache (L3) remote KV recall stages.  Storage-hit probe (batch_exists)
     # and the actual remote fetch (MooncakeStore.batch_get_v1/v2) get their
     # own stage names so the schedules can be aggregated per remote fetch.
+    # Both sit above the default trace_level (3), so they are opt-in:
+    #   trace_level >= 4 -> emit the batch_get fetch slice
+    #   trace_level >= 5 -> also emit the batch_exists hit-probe slice
     HICACHE_STORAGE_HIT_QUERY = RequestStageConfig(
         "hicache_storage_hit_query",
-        level=1,
+        level=5,
     )
     HICACHE_MOONCAKE_FETCH = RequestStageConfig(
         "hicache_mooncake_fetch",
-        level=1,
+        level=4,
     )
 
 
