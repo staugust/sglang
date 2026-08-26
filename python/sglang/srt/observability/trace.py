@@ -328,6 +328,7 @@ def create_hicache_trace_ctx(
     processes the op.
     """
     external_trace_header: Optional[Dict[str, str]] = None
+    trace_level = None
     if (
         parent_trace_ctx is not None
         and parent_trace_ctx.tracing_enable
@@ -338,12 +339,14 @@ def create_hicache_trace_ctx(
         _trace_context_propagator.inject(
             external_trace_header, parent_trace_ctx.root_span_context
         )
+        trace_level = parent_trace_ctx.trace_level
 
     ctx = TraceReqContext(
         rid=rid,
         role="HiCache",
         module_name=HICACHE_TRACE_MODULE,
         external_trace_header=external_trace_header,
+        trace_level=trace_level,
     )
     if not ctx.tracing_enable:
         return TraceNullContext()
