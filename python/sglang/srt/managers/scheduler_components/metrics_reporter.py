@@ -693,6 +693,39 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
+    def _get_gpu_token_availability(self):
+        """Returns (free_tokens, evictable_tokens, effective_tokens, total_tokens)
+        for GPU KV pool.  evictable already excludes anchor-locked nodes because
+        inc_full_pin adds a component lock, making those tree nodes non-evictable.
+        effective = free + evictable = max tokens allocatable after evicting
+        all unlocked cache entries.
+        """
+        tc = self.scheduler.tree_cache
+        alloc = self.scheduler.token_to_kv_pool_allocator
+        if tc is None or alloc is None:
+            return None
+        free = alloc.available_size()
+        if tc.supports_mamba():
+            evictable = tc.full_evictable_size()
+        else:
+            evictable = tc.evictable_size()
+        effective = free + evictable
+        total = alloc.size if hasattr(alloc, "size") else 0
+        return (free, evictable, effective, total)
+
+    def _get_gpu_avail_msg(self, suffix: str = ", ") -> str:
+        """GPU token availability message, or empty string if unavailable."""
+        avail = self._get_gpu_token_availability()
+        if avail is None:
+            return ""
+        free, evictable, effective, total = avail
+        return (
+            f"#gpu-free-token: {free}{suffix}"
+            f"#gpu-evictable-token: {evictable}{suffix}"
+            f"#gpu-effective-token: {effective}{suffix}"
+            f"#gpu-total-token: {total}{suffix}"
+        )
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
@@ -733,6 +766,7 @@ class SchedulerMetricsReporter:
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
             f"{token_usage_msg}"
+            f"{self._get_gpu_avail_msg()}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
@@ -937,7 +971,11 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = (
+            f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, "
+            f"{token_usage_msg}"
+            f"{self._get_gpu_avail_msg()}"
+        )
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0

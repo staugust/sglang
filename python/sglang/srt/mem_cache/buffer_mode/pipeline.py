@@ -1565,6 +1565,16 @@ class BufferModePipeline:
         self.staged_prefetches[request] = staged
         cache.prefetch_loaded_tokens_by_reqid[request] = staged.num_tokens
         cache.prefetch_loaded_storage_start_by_reqid[request] = operation.storage_start
+        logger.info(
+            "HiCache staged for load-back req=%s loadback_tokens=%d "
+            "occupied_tokens=%d matched_len=%d "
+            "storage_start=%d",
+            request.rid,
+            staged.num_tokens,
+            staged.occupied_tokens,
+            staged.matched_len,
+            operation.storage_start,
+        )
         return True
 
     def _build_staged_prefetch(
