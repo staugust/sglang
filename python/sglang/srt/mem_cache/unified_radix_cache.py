@@ -1356,8 +1356,34 @@ class UnifiedRadixCache(BasePrefixCache):
             # The tree never holds host values in buffer mode, and staging
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
+        if self.host_pool_group is not None:
+            host_total_tokens = self.host_pool_group.size
+            host_used_before = host_total_tokens - self.host_pool_group.available_size()
+        else:
+            host_total_tokens = 0
+            host_used_before = 0
+
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
+
+        host_used_after = (
+            host_total_tokens - self.host_pool_group.available_size()
+            if self.host_pool_group is not None
+            else 0
+        )
+        host_pinned_tokens = self.tree_core.host_pinned_tokens()
+        released_tokens = result.tracker.get(component_type, 0)
+        if released_tokens <= 0:
+            return 0
+        logger.info(
+            "HiCache L2 host eviction %s: released=%d tokens, host used %d -> %d, pinned=%d tokens, total=%d tokens",
+            component_type.name,
+            released_tokens,
+            host_used_before,
+            host_used_after,
+            host_pinned_tokens,
+            host_total_tokens,
+        )
         return result.tracker.get(component_type, 0)
 
     # ---- Decode retraction ----
@@ -2608,6 +2634,38 @@ class UnifiedRadixCache(BasePrefixCache):
                 num_tokens, reason
             )
 
+    def _host_pinned_tokens(self) -> int:
+        counter = getattr(self.tree_core, "host_pinned_tokens", None)
+        return counter() if counter is not None else 0
+
+    def _log_l3_prefetch_l2_admission(
+        self,
+        request: CacheRequestHandle,
+        *,
+        hit_tokens: int,
+        alloc_tokens: int,
+        status: str,
+    ) -> None:
+        """Log the L2 admission result of a storage prefetch for one request."""
+        if self.cache_controller is None:
+            return
+        if self.host_pool_group is None:
+            return
+        host_total_tokens = self.host_pool_group.size
+        host_used_tokens = host_total_tokens - self.host_pool_group.available_size()
+        host_pinned_tokens = self._host_pinned_tokens()
+        logger.info(
+            "HiCache L3 prefetch L2 admission req=%s status=%s hit=%d alloc=%d used=%d total=%d pinned=%d threshold=%d",
+            request.rid,
+            status,
+            hit_tokens,
+            alloc_tokens,
+            host_used_tokens,
+            host_total_tokens,
+            host_pinned_tokens,
+            self.prefetch_threshold,
+        )
+
     def pop_prefetch_loaded_tokens(self, request: CacheRequestHandle) -> int:
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         return self.prefetch_loaded_tokens_by_reqid.pop(request, 0)
@@ -2966,6 +3024,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 evict_host=self.evict_host,
             )
             if host_indices is None:
+                self._log_l3_prefetch_l2_admission(
+                    request,
+                    hit_tokens=hit_tokens,
+                    alloc_tokens=0,
+                    status="revoke",
+                )
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
@@ -2980,6 +3044,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if not self._alloc_prefetch_aux_staging(info, aux_hit_tokens):
                 # Same outcome as a KV shortfall: nothing stays staged.
                 cc.append_host_mem_release(host_indices=host_indices)
+                self._log_l3_prefetch_l2_admission(
+                    request,
+                    hit_tokens=hit_tokens,
+                    alloc_tokens=0,
+                    status="revoke_aux",
+                )
                 self._finish_storage_prefetch(
                     request, fulfilled_tokens=0, reason="host_capacity"
                 )
@@ -2992,6 +3062,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 return True
 
+            self._log_l3_prefetch_l2_admission(
+                request,
+                hit_tokens=hit_tokens,
+                alloc_tokens=alloc_len,
+                status="full" if alloc_len == hit_tokens else "partial",
+            )
             self._resolve_storage_prefetch_tokens(
                 request, hit_tokens - alloc_len, reason="host_capacity"
             )
@@ -3026,6 +3102,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 if operation.is_terminated():
                     # Controller-side miss termination (retryable) or an abort
                     # race (abort cleanup discards the marker).
+                    self._log_l3_prefetch_l2_admission(
+                        request,
+                        hit_tokens=hit_tokens,
+                        alloc_tokens=0,
+                        status="revoke_terminated",
+                    )
                     if hit_tokens > 0:
                         self._finish_storage_prefetch(
                             request,
@@ -3044,6 +3126,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     continue
                 if hit_tokens < self.prefetch_threshold:
                     # Below-threshold hits are not worth the transfer.
+                    self._log_l3_prefetch_l2_admission(
+                        request,
+                        hit_tokens=hit_tokens,
+                        alloc_tokens=0,
+                        status="revoke_below_threshold",
+                    )
                     self._account_prefetch_outcome(operation, revoked=True)
                     self._finish_storage_prefetch(
                         request, fulfilled_tokens=0, reason="below_threshold"

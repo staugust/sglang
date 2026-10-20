@@ -1910,6 +1910,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
         return result
 
+    def host_pinned_tokens(self) -> int:
+        """Count host tokens currently pinned by host lock refs."""
+        pinned_tokens = 0
+        for node in self._collect_all_nodes():
+            for cd in node.component_data.values():
+                if cd.host_lock_ref > 0 and cd.host_value is not None:
+                    pinned_tokens += len(cd.host_value)
+        return pinned_tokens
+
     def evict_excess_path_states(
         self,
         tail_node_id: NodeId,
