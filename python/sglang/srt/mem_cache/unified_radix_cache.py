@@ -2642,6 +2642,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         request: CacheRequestHandle,
         *,
+        query_tokens: int,
         hit_tokens: int,
         alloc_tokens: int,
         status: str,
@@ -2655,9 +2656,10 @@ class UnifiedRadixCache(BasePrefixCache):
         host_used_tokens = host_total_tokens - self.host_pool_group.available_size()
         host_pinned_tokens = self._host_pinned_tokens()
         logger.info(
-            "HiCache L3 prefetch L2 admission req=%s status=%s hit=%d alloc=%d used=%d total=%d pinned=%d threshold=%d",
+            "HiCache L3 prefetch L2 admission req=%s status=%s query=%d hit=%d alloc=%d used=%d total=%d pinned=%d threshold=%d",
             request.rid,
             status,
+            query_tokens,
             hit_tokens,
             alloc_tokens,
             host_used_tokens,
@@ -3026,6 +3028,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if host_indices is None:
                 self._log_l3_prefetch_l2_admission(
                     request,
+                    query_tokens=operation.stats_requested_tokens,
                     hit_tokens=hit_tokens,
                     alloc_tokens=0,
                     status="revoke",
@@ -3046,6 +3049,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 cc.append_host_mem_release(host_indices=host_indices)
                 self._log_l3_prefetch_l2_admission(
                     request,
+                    query_tokens=operation.stats_requested_tokens,
                     hit_tokens=hit_tokens,
                     alloc_tokens=0,
                     status="revoke_aux",
@@ -3064,6 +3068,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
             self._log_l3_prefetch_l2_admission(
                 request,
+                query_tokens=operation.stats_requested_tokens,
                 hit_tokens=hit_tokens,
                 alloc_tokens=alloc_len,
                 status="full" if alloc_len == hit_tokens else "partial",
@@ -3104,6 +3109,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     # race (abort cleanup discards the marker).
                     self._log_l3_prefetch_l2_admission(
                         request,
+                        query_tokens=operation.stats_requested_tokens,
                         hit_tokens=hit_tokens,
                         alloc_tokens=0,
                         status="revoke_terminated",
@@ -3128,6 +3134,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     # Below-threshold hits are not worth the transfer.
                     self._log_l3_prefetch_l2_admission(
                         request,
+                        query_tokens=operation.stats_requested_tokens,
                         hit_tokens=hit_tokens,
                         alloc_tokens=0,
                         status="revoke_below_threshold",
