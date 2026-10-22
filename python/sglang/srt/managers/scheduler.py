@@ -4050,7 +4050,10 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        log_prefill_admission = get_parallel().tp_rank == 0
         if self.chunked_req is not None:
+            chunked_req = self.chunked_req
+            can_run_count_before = len(adder.can_run_list)
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 self.chunked_req,
@@ -4059,6 +4062,15 @@ class Scheduler(
                 self.page_size,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            if (
+                log_prefill_admission
+                and len(adder.can_run_list) > can_run_count_before
+                and adder.can_run_list[-1] is chunked_req
+            ):
+                logger.info(
+                    "Prefill admission added chunked_req=%s to batch",
+                    chunked_req.rid,
+                )
 
         if self.enable_lora:
             running_loras = {
@@ -4077,7 +4089,6 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
-        log_prefill_admission = get_parallel().tp_rank == 0
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
@@ -4185,9 +4196,8 @@ class Scheduler(
                 and req is adder.can_run_list[-1]
             ):
                 logger.info(
-                    "Prefill admission added req=%s to batch; chunked_req=%s",
+                    "Prefill admission added req=%s to batch",
                     req.rid,
-                    self.chunked_req.rid if self.chunked_req is not None else None,
                 )
 
             if self.enable_lora:
