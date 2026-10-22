@@ -1373,16 +1373,20 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         host_pinned_tokens = self.tree_core.host_pinned_tokens()
         released_tokens = result.tracker.get(component_type, 0)
-        if released_tokens <= 0:
-            return 0
+        l3_prefetch_tokens_by_req = [
+            (request.rid, int(info.host_indices.numel()))
+            for request, info in self.ongoing_prefetch.items()
+            if info.host_indices is not None and info.host_indices.numel() > 0
+        ]
         logger.info(
-            "HiCache L2 host eviction %s: released=%d tokens, host used %d -> %d, pinned=%d tokens, total=%d tokens",
+            "HiCache L2 host eviction %s: released=%d tokens, host used %d -> %d, pinned=%d tokens, total=%d tokens, L3 prefetch L2 tokens by req=%s",
             component_type.name,
             released_tokens,
             host_used_before,
             host_used_after,
             host_pinned_tokens,
             host_total_tokens,
+            l3_prefetch_tokens_by_req,
         )
         return result.tracker.get(component_type, 0)
 
