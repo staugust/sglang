@@ -279,7 +279,12 @@ def _dataclass_to_string_truncated(
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
-                f"{f.name}={_dataclass_to_string_truncated(values[f.name], max_length)}"
+                (
+                    f"{f.name}_len={len(values[f.name])}, "
+                    if isinstance(values[f.name], (list, tuple))
+                    else ""
+                )
+                + f"{f.name}={_dataclass_to_string_truncated(values[f.name], max_length)}"
                 for f in fields
                 if f.name not in skip_names
             )
