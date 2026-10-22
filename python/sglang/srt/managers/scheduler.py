@@ -4179,6 +4179,12 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if (
+                log_prefill_admission
+                and adder.can_run_list
+                and req is adder.can_run_list[-1]
+            ):
+                logger.info("Prefill admission added req=%s to batch", req.rid)
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
