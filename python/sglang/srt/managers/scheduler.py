@@ -4077,9 +4077,15 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        log_prefill_admission = get_parallel().tp_rank == 0
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                if log_prefill_admission:
+                    logger.info(
+                        "Prefill admission skipped req=%s: LoRA is not schedulable",
+                        req.rid,
+                    )
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4089,6 +4095,11 @@ class Scheduler(
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
             ):
+                if log_prefill_admission:
+                    logger.info(
+                        "Prefill admission skipped req=%s: pooling mode differs from batch",
+                        req.rid,
+                    )
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -4111,6 +4122,11 @@ class Scheduler(
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
+                    if log_prefill_admission:
+                        logger.info(
+                            "Prefill admission skipped req=%s: running batch is full",
+                            req.rid,
+                        )
                     break
 
             if self.enable_hicache_storage or self.enable_lmcache:
@@ -4120,6 +4136,11 @@ class Scheduler(
                 req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    if log_prefill_admission:
+                        logger.info(
+                            "Prefill admission skipped req=%s: storage prefetch is still in progress",
+                            req.rid,
+                        )
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -4137,11 +4158,21 @@ class Scheduler(
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
+                if log_prefill_admission:
+                    logger.info(
+                        "Prefill admission skipped req=%s: device cache hit was lost during prefetch",
+                        req.rid,
+                    )
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
+                    if log_prefill_admission:
+                        logger.info(
+                            "Prefill admission skipped req=%s: storage staging is not ready",
+                            req.rid,
+                        )
                     continue
             res = adder.add_one_req(
                 req,
@@ -4153,6 +4184,12 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                if log_prefill_admission:
+                    logger.info(
+                        "Prefill admission stopped at req=%s: PrefillAdder returned %s",
+                        req.rid,
+                        res.name,
+                    )
                 if res == AddReqResult.NO_TOKEN:
                     # Set batch_is_full after making sure there are requests that can be served
                     running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
