@@ -4184,7 +4184,11 @@ class Scheduler(
                 and adder.can_run_list
                 and req is adder.can_run_list[-1]
             ):
-                logger.info("Prefill admission added req=%s to batch", req.rid)
+                logger.info(
+                    "Prefill admission added req=%s to batch; chunked_req=%s",
+                    req.rid,
+                    self.chunked_req.rid if self.chunked_req is not None else None,
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
