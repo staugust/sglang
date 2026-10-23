@@ -218,6 +218,7 @@ from sglang.srt.managers.schedule_batch import (
     retract_all,
 )
 from sglang.srt.managers.schedule_policy import (
+    CLIP_MAX_NEW_TOKENS,
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
@@ -1289,6 +1290,7 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue: List[Req] = []
+        self._last_prefill_waiting_gate_log_time = 0.0
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -3973,6 +3975,54 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            now = time.monotonic()
+            if (
+                running_batch.batch_is_full
+                and self.waiting_queue
+                and now - self._last_prefill_waiting_gate_log_time >= 30.0
+                and get_parallel().tp_rank == 0
+            ):
+                waiting_snapshot = [
+                    (
+                        index,
+                        req.rid,
+                        round(now - req.time_stats.wait_queue_entry_time, 1)
+                        if req.time_stats.wait_queue_entry_time > 0
+                        else None,
+                        req.host_hit_length,
+                        req.storage_hit_length,
+                    )
+                    for index, req in enumerate(self.waiting_queue)
+                ]
+                l1_available = self.token_to_kv_pool_allocator.available_size()
+                l1_evictable = self.tree_cache.evictable_size()
+                decode_reserve = sum(
+                    min(
+                        max(
+                            req.sampling_params.max_new_tokens - len(req.output_ids),
+                            0,
+                        ),
+                        CLIP_MAX_NEW_TOKENS,
+                    )
+                    * (
+                        1.0
+                        if req.sampling_params.ignore_eos
+                        else self.new_token_ratio_tracker.current
+                    )
+                    for req in running_batch.reqs
+                )
+                logger.info(
+                    "Prefill admission gated by batch_is_full running_bs=%d waiting=%d l1_available=%d l1_evictable=%d l1_effective=%d estimated_decode_reserve=%.1f estimated_remaining=%0.1f waiting_reqs(index,rid,wait_s,host_hit,storage_hit)=%s",
+                    running_batch.batch_size(),
+                    len(self.waiting_queue),
+                    l1_available,
+                    l1_evictable,
+                    l1_available + l1_evictable,
+                    decode_reserve,
+                    l1_available + l1_evictable - decode_reserve,
+                    waiting_snapshot,
+                )
+                self._last_prefill_waiting_gate_log_time = now
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -4196,8 +4246,14 @@ class Scheduler(
                 and req is adder.can_run_list[-1]
             ):
                 logger.info(
-                    "Prefill admission added req=%s to batch",
+                    "Prefill admission added req=%s to batch wait_s=%.1f device_prefix=%d host_hit=%d storage_hit=%d",
                     req.rid,
+                    max(0.0, time.monotonic() - req.time_stats.wait_queue_entry_time)
+                    if req.time_stats.wait_queue_entry_time > 0
+                    else -1.0,
+                    req.prefix_len,
+                    req.host_hit_length,
+                    req.storage_hit_length,
                 )
 
             if self.enable_lora:
@@ -4211,6 +4267,55 @@ class Scheduler(
                         res.name,
                     )
                 if res == AddReqResult.NO_TOKEN:
+                    if log_prefill_admission:
+                        budget = adder.memory_budget
+                        max_new = min(
+                            max(
+                                req.sampling_params.max_new_tokens
+                                - len(req.output_ids),
+                                0,
+                            ),
+                            CLIP_MAX_NEW_TOKENS,
+                        )
+                        extend_input_len = (
+                            len(req.full_untruncated_fill_ids) - req.prefix_len
+                        )
+                        request_slot_reserve = adder._request_slot_reserve_for_req(req)
+                        mamba_gap_reserve = adder._mamba_gap_budget_for_req(
+                            req, include_host_hit=True
+                        )
+                        estimated_required = (
+                            extend_input_len
+                            + max_new
+                            + adder.per_req_token_overhead
+                            + request_slot_reserve
+                            + mamba_gap_reserve
+                        )
+                        logger.info(
+                            "Prefill NO_TOKEN budget req=%s wait_s=%.1f required_estimate=%d extend_input=%d max_new=%d overhead=%d request_slot_reserve=%d mamba_gap_reserve=%d l1_available=%d l1_evictable=%d remaining_total=%d remaining_current=%d total_offset=%d current_offset=%d device_prefix=%d host_hit=%d storage_hit=%d",
+                            req.rid,
+                            max(
+                                0.0,
+                                time.monotonic() - req.time_stats.wait_queue_entry_time,
+                            )
+                            if req.time_stats.wait_queue_entry_time > 0
+                            else -1.0,
+                            estimated_required,
+                            extend_input_len,
+                            max_new,
+                            adder.per_req_token_overhead,
+                            request_slot_reserve,
+                            mamba_gap_reserve,
+                            self.token_to_kv_pool_allocator.available_size(),
+                            self.tree_cache.evictable_size(),
+                            budget.remaining_total,
+                            budget.remaining_current,
+                            budget.total_offset,
+                            budget.current_offset,
+                            req.prefix_len,
+                            req.host_hit_length,
+                            req.storage_hit_length,
+                        )
                     # Set batch_is_full after making sure there are requests that can be served
                     running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                         not running_batch.is_empty()
