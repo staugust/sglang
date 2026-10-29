@@ -1,0 +1,22 @@
+python/sglang/srt/managers/scheduler.py
+  s_a4d0bef2d32b08::t_e1fd41fe416e93 3933-3944,3946-3962,3964,3966-3969
+  s_a4d0bef2d32b08::t_11f7e6413ba767 3965
+  s_a4d0bef2d32b08::t_0d20c5df83ce6f 3808,3827-3829,3849-3851,4010-4012,4016,4095-4097,4220-4222,4227-4229,4369-4372,4478-4480,4557,4564,4636,5908-5910
+  s_a4d0bef2d32b08::t_5900b363b51259 3945,3963
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "91d0cd94e1231272bf1fbda04ac744b5f32c3a0c",
+  "prompts": {},
+  "sessions": {
+    "s_a4d0bef2d32b08": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a17881-d51e-7db1-b86e-b8441c7e2ca6",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Augusto <augusto@U-FVHJH4X1-2322.local>"
+    }
+  }
+}
