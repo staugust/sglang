@@ -3805,7 +3805,7 @@ class Scheduler(
                     running_batch.merge_batch(new_batch)
                 running_batch.hisparse_coordinator = self.hisparse_coordinator
             # Reset batch_is_full so the scheduler can schedule more prefills.
-            running_batch.batch_is_full = False
+            self._set_batch_is_full(running_batch, False, "hisparse_admission_cycle")
 
         if (
             not self.enable_hisparse
@@ -3824,7 +3824,9 @@ class Scheduler(
             last_bs = last_batch.batch_size()
             last_batch.filter_batch(reqs_to_exclude=list(reqs_to_exclude))
             if last_batch.batch_size() < last_bs:
-                running_batch.batch_is_full = False
+                self._set_batch_is_full(
+                    running_batch, False, "last_prefill_batch_shrank"
+                )
 
             # Merge the new batch into the running batch. A running batch that
             # DP attention converted to extend is last_batch itself: filtered
@@ -3844,7 +3846,9 @@ class Scheduler(
         if running_batch.is_prefill_only:
             running_batch.filter_batch()
             if running_batch.is_empty():
-                running_batch.batch_is_full = False
+                self._set_batch_is_full(
+                    running_batch, False, "prefill_only_batch_empty"
+                )
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -3926,6 +3930,43 @@ class Scheduler(
 
         return res
 
+    def _set_batch_is_full(
+        self, batch: ScheduleBatch, is_full: bool, reason: str
+    ) -> None:
+        """Set the prefill gate and log every state transition with its cause."""
+        old_value = bool(batch.batch_is_full)
+        new_value = bool(is_full)
+        if old_value == new_value:
+            return
+
+        if get_parallel().tp_rank == 0:
+            reqs = [req.rid for req in batch.reqs[:8]]
+            waiting = [req.rid for req in self.waiting_queue[:4]]
+            chunked_req = getattr(self, "chunked_req", None)
+            available_req_slots = (
+                self.req_to_token_pool.available_size()
+                if hasattr(self, "req_to_token_pool")
+                else -1
+            )
+            result_queue_len = (
+                len(self.result_queue) if hasattr(self, "result_queue") else -1
+            )
+            logger.info(
+                "batch_is_full transition old=%s new=%s reason=%s running_bs=%d running_reqs=%s waiting=%d waiting_head=%s chunked_req=%s req_slots_available=%d max_running_requests=%d result_queue=%d",
+                old_value,
+                new_value,
+                reason,
+                batch.batch_size(),
+                reqs,
+                len(self.waiting_queue),
+                waiting,
+                chunked_req.rid if chunked_req is not None else None,
+                available_req_slots,
+                getattr(self, "max_running_requests", -1),
+                result_queue_len,
+            )
+        batch.batch_is_full = new_value
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3966,11 +4007,13 @@ class Scheduler(
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
-            running_batch.batch_is_full = False
+            self._set_batch_is_full(
+                running_batch, False, "priority_preemption_or_hybrid_swa"
+            )
         if running_batch.is_empty():
             # An empty batch never reaches update_running_batch, the only
             # other place that clears the flag, so admission would stay shut.
-            running_batch.batch_is_full = False
+            self._set_batch_is_full(running_batch, False, "running_batch_empty")
 
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -4049,7 +4092,9 @@ class Scheduler(
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
-            running_batch.batch_is_full = True
+            self._set_batch_is_full(
+                running_batch, True, "no_allocatable_request_slots"
+            )
             return None, running_batch
 
         # Get priority queue
@@ -4172,12 +4217,16 @@ class Scheduler(
                 candidate_beam_width,
                 running_batch=running_batch,
             ):
-                running_batch.batch_is_full = True
+                self._set_batch_is_full(
+                    running_batch, True, "prefill_request_limit_reached"
+                )
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    running_batch.batch_is_full = True
+                    self._set_batch_is_full(
+                        running_batch, True, "disagg_prefill_request_slots_full"
+                    )
 
             if running_batch.batch_is_full:
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
@@ -4317,8 +4366,10 @@ class Scheduler(
                             req.storage_hit_length,
                         )
                     # Set batch_is_full after making sure there are requests that can be served
-                    running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
-                        not running_batch.is_empty()
+                    self._set_batch_is_full(
+                        running_batch,
+                        len(adder.can_run_list) > 0 or not running_batch.is_empty(),
+                        "prefill_no_token",
                     )
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
@@ -4424,7 +4475,9 @@ class Scheduler(
             finishing_reqs = self._reqs_finishing_inflight(running_batch)
             running_batch.filter_batch(reqs_to_exclude=finishing_reqs)
             if finishing_reqs:
-                running_batch.batch_is_full = False
+                self._set_batch_is_full(
+                    running_batch, False, "mixed_chunk_finishing_requests"
+                )
             # The prefill admitted above may leave no KV room for the decode
             # rows. They then sit out this step and decode on the next decode
             # step, which fits them; a mixed step does not retract them.
@@ -4501,14 +4554,14 @@ class Scheduler(
         finishing_reqs = self._reqs_finishing_inflight(batch)
         batch.filter_batch(reqs_to_exclude=finishing_reqs)
         if batch.is_empty():
-            batch.batch_is_full = False
+            self._set_batch_is_full(batch, False, "running_batch_empty")
             return batch
 
         kv_full_retract_flag = not batch.check_decode_mem()
         if kv_full_retract_flag and finishing_reqs:
             # The queued result frees the finishing requests' KV at the end of
             # this step; decode the rest next step instead of retracting them.
-            batch.batch_is_full = False
+            self._set_batch_is_full(batch, False, "finishing_requests_free_kv")
             return None
 
         # Check if decode out of memory
@@ -4580,7 +4633,7 @@ class Scheduler(
             self.new_token_ratio_tracker.decay_step()
 
         if batch.batch_size() < initial_bs:
-            batch.batch_is_full = False
+            self._set_batch_is_full(batch, False, "running_batch_shrank")
 
         if batch.is_empty():
             return batch
@@ -5852,7 +5905,9 @@ class Scheduler(
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
                 self._add_request_to_queue(req)
-        self.running_batch.batch_is_full = False
+        self._set_batch_is_full(
+            self.running_batch, False, "pause_generation_retract"
+        )
         # In disagg-PREFILL, keep a live mid-chunk chunked_req rather than retract it:
         # freeing its KV under a live disagg KV-sender crashes pop_bootstrapped or
         # sends freed/reused KV to decode. Kept, it resumes prefill after the pause.
