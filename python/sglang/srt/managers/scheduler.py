@@ -4133,10 +4133,18 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
+            adder.log_memory("candidate_before_match", req)
             req.init_next_round_input(self.tree_cache)
+            adder.log_memory(
+                "candidate_matched",
+                req,
+                prefix=req.prefix_len,
+                host_hit=req.host_hit_length,
+            )
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
+                adder.log_memory("candidate_storage_reissued", req)
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
@@ -4223,14 +4231,18 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
+        new_batch.prefill_memory_trace_id = adder.memory_debug_id
 
+        adder.log_memory("batch_before_load_submit")
         if self.enable_hierarchical_cache or self.enable_unified_cache_external_linker:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
 
+        adder.log_memory("batch_before_extend_alloc")
         new_batch.prepare_for_extend()
+        adder.log_memory("batch_after_extend_alloc")
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:

@@ -191,7 +191,20 @@ def alloc_paged_token_slots_extend(
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * (
         allocator.page_size * page_interleave_shard_size(allocator)
     )
+    memory_before_evict = None
+    if get_parallel().tp_rank == 0:
+        memory_before_evict = available_and_evictable_str(tree_cache)
     evict_from_tree_cache(tree_cache, num_tokens)
+    if get_parallel().tp_rank == 0:
+        logger.info(
+            "Prefill memory trace=%s stage=alloc_after_evict "
+            "requested_tokens=%d eviction_target=%d before=%s after=%s",
+            getattr(batch, "prefill_memory_trace_id", None),
+            extend_num_tokens,
+            num_tokens,
+            memory_before_evict,
+            available_and_evictable_str(tree_cache),
+        )
 
     is_dsv4 = req_pool_indices is not None and hasattr(allocator, "c128_attn_allocator")
     extra_alloc_kwargs = {}
@@ -228,6 +241,22 @@ def alloc_paged_token_slots_extend(
         out_cache_loc = out
 
     if out_cache_loc is None:
+        # Keep the batch identity on every rank when allocation fails.
+        logger.error(
+            "Prefill memory trace=%s stage=alloc_failed "
+            "requested_tokens=%d eviction_target=%d "
+            "reqs(rid,prefix,extend,host_loaded)=%s capacity=%s",
+            getattr(batch, "prefill_memory_trace_id", None),
+            extend_num_tokens,
+            num_tokens,
+            [
+                (r.rid, r.prefix_len, r.extend_len, r.host_loaded_length)
+                for r in batch.reqs
+            ]
+            if batch is not None
+            else None,
+            available_and_evictable_str(tree_cache),
+        )
         error_msg = (
             f"Prefill out of memory. Try to lower your batch size.\n"
             f"Try to allocate {extend_num_tokens} tokens.\n"

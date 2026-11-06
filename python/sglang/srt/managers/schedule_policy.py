@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
@@ -8,6 +9,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_memory,
+    get_parallel,
     get_schedule,
 )
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported, is_hip
@@ -607,6 +609,7 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
+        self.memory_debug_id = f"{time.monotonic_ns():x}"
         self.dllm_config = dllm_config
         # Mamba checkpoints only land on page-aligned chunk ends.
         self.exact_chunk_fill = (
@@ -1089,13 +1092,56 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
+    def log_memory(self, stage: str, req: Optional[Req] = None, **details) -> None:
+        """CPU-only snapshots; never synchronize a device or change admission."""
+        if get_parallel().tp_rank != 0:
+            return
+        budget = self.memory_budget
+        evictable = (
+            self.tree_cache.full_evictable_size()
+            if self.tree_cache.supports_mamba()
+            else self.tree_cache.evictable_size()
+        )
+        available = self.token_to_kv_pool_allocator.available_size()
+        logger.info(
+            "Prefill memory trace=%s stage=%s req=%s budget=%s "
+            "available=%d evictable=%d effective=%d "
+            "remaining_total=%s remaining_current=%s remaining_swa=%s "
+            "total_offset=%s current_offset=%s "
+            "pending_write=%d pending_load=%d "
+            "admitted(rid,prefix,extend,host_loaded)=%s details=%s",
+            self.memory_debug_id,
+            stage,
+            req.rid if req is not None else None,
+            type(budget).__name__,
+            available,
+            evictable,
+            available + evictable,
+            budget.remaining_total,
+            budget.remaining_current,
+            budget.remaining_swa,
+            budget.total_offset,
+            budget.current_offset,
+            len(getattr(self.tree_cache, "ongoing_write_through", {})),
+            len(getattr(self.tree_cache, "ongoing_load_back", {})),
+            [
+                (r.rid, r.prefix_len, r.extend_len, r.host_loaded_length)
+                for r in self.can_run_list
+            ],
+            details,
+        )
+
     def add_chunked_req(self, req: Req):
+        self.log_memory(
+            "chunk_begin", req, prefix=req.prefix_len, chunk_limit=self.rem_chunk_tokens
+        )
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
             _rem_tokens = self.memory_budget.available_chunk_tokens(
                 self.rem_chunk_tokens
             )
+            self.log_memory("chunk_budget", req, returned_chunk_tokens=_rem_tokens)
             if _rem_tokens is None:
                 return req
             if self.kv_shard_granule:
@@ -1132,6 +1178,15 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        self.log_memory(
+            "chunk_selected",
+            req,
+            selected_tokens=new_len,
+            paged_tokens=self.ceil_paged_tokens(new_len),
+            overhead=self.per_req_token_overhead,
+            prefix=req.prefix_len,
+            truncated=truncated,
+        )
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
@@ -1145,6 +1200,9 @@ class PrefillAdder:
             max_new_tokens=self._swa_new_tokens(req),
             chunk_limit=self.rem_chunk_tokens,
         ):
+            self.log_memory(
+                "chunk_rejected", req, request_slot_reserve=request_slot_reserve
+            )
             return req
         # The continuing chunk must fit. Keep reservation outside assert for -O.
         reserved = self._kv_shard_reserve_scratch(
@@ -1167,6 +1225,9 @@ class PrefillAdder:
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
             compute_charge=req.extend_len if self.exact_chunk_fill else None,
+        )
+        self.log_memory(
+            "chunk_reserved", req, request_slot_reserve=request_slot_reserve
         )
 
         # Return if chunked prefill not finished
@@ -1369,7 +1430,15 @@ class PrefillAdder:
 
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
+        self.log_memory(
+            "candidate_before_pin",
+            req,
+            prefix=req.prefix_len,
+            host_hit=req.host_hit_length,
+            required_tokens=total_tokens,
+        )
         with self._lock_node(req.last_node):
+            self.log_memory("candidate_pinned", req)
             admission = self._select_prefill_admission(
                 req,
                 total_tokens=total_tokens,
@@ -1379,6 +1448,7 @@ class PrefillAdder:
                 has_chunked_req=has_chunked_req,
             )
             if isinstance(admission, AddReqResult):
+                self.log_memory("candidate_rejected", req, result=admission.name)
                 return admission
 
             # A rejected candidate must not report prefillable or queue H2D.
@@ -1394,6 +1464,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
 
             if req.needs_host_load_back():
+                self.log_memory("load_back_begin", req, host_hit=req.host_hit_length)
                 load_max_new = min(max_new, admission.max_new_tokens)
                 # Reclaim can write back device victims and evict host leaves.
                 # Pin the selected host/aux match until load-back owns its locks.
@@ -1402,6 +1473,7 @@ class PrefillAdder:
                     if isinstance(self.tree_cache, UnifiedRadixCache)
                     else nullcontext()
                 ):
+                    self.log_memory("load_back_pinned", req)
                     full_load_tokens = req.host_hit_length
                     if (
                         self.memory_budget.load_back_needs_full_tokens
@@ -1435,7 +1507,11 @@ class PrefillAdder:
                         swa_host_hit_length=req.swa_host_hit_length,
                         chunk_limit=self.rem_chunk_tokens,
                     ):
+                        self.log_memory("load_back_prepare_rejected", req)
                         return AddReqResult.NO_TOKEN
+                    self.log_memory(
+                        "load_back_prepared", req, full_load_tokens=full_load_tokens
+                    )
                     promised_host_hit = req.host_hit_length
                     loaded = self.tree_cache.init_load_back(
                         InitLoadBackParams(
@@ -1443,6 +1519,11 @@ class PrefillAdder:
                             host_hit_length=req.host_hit_length,
                             req=req,
                         )
+                    )
+                    self.log_memory(
+                        "load_back_queued",
+                        req,
+                        loaded_tokens=loaded[0] if loaded is not None else None,
                     )
                 if loaded is None:
                     return AddReqResult.OTHER
@@ -1497,6 +1578,7 @@ class PrefillAdder:
 
             self._commit_prefill_admission(req, admission, mamba_gap_reserve)
 
+        self.log_memory("candidate_committed", req)
         # This verdict controls the next candidate, not the committed request.
         return self.budget_state()
 
