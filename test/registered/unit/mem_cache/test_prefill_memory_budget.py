@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedMambaSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget, SWAPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
@@ -227,6 +227,64 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                     req, has_chunked_req=False, truncation_align_size=None
                 )
                 self.assertEqual(adder.can_run_list, [req])
+
+
+class TestChunkedPrefillCapacity(unittest.TestCase):
+    def _continuation(self, *, effective, prefix):
+        req = Req(
+            rid="continuing-prefill",
+            origin_input_text=None,
+            origin_input_ids=array("q", [1] * 73607),
+            sampling_params=SamplingParams(max_new_tokens=825),
+        )
+        req.refresh_fill_ids()
+        req.prefix_len = prefix
+        req.extend_end = prefix
+        allocator = SimpleNamespace(page_size=64, available_size=lambda: effective)
+        cache = SimpleNamespace(supports_mamba=lambda: False, evictable_size=lambda: 0)
+        budget = PrefillBudget(allocator, cache)
+        budget.total_offset = 5160
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.page_size = 64
+        adder.per_req_token_overhead = 64
+        adder.memory_budget = budget
+        adder.dllm_config = None
+        adder.rem_chunk_tokens = 8192
+        adder.kv_shard_granule = 0
+        adder.prefill_delayer_single_pass = None
+        adder.chunked_req_limit = None
+        adder.exact_chunk_fill = False
+        adder.can_run_list = []
+        adder._request_slot_reserve_for_req = MagicMock(return_value=0)
+        adder._kv_shard_reserve_scratch = MagicMock(return_value=True)
+        adder._mamba_gap_budget_for_req = MagicMock(return_value=0)
+        adder._update_prefill_budget = MagicMock()
+        return req, adder
+
+    def test_continuation_waits_when_reservation_exceeds_capacity(self):
+        for effective, prefix, remaining in (
+            # 216 raw tokens require 256 paged tokens plus 64 overhead.
+            (5376, 65536, 216),
+            # Negative budget falls back to an 8192-token chunk limit.
+            (5120, 65752, -40),
+        ):
+            with self.subTest(remaining=remaining):
+                req, adder = self._continuation(effective=effective, prefix=prefix)
+                self.assertEqual(adder.memory_budget.remaining_total, remaining)
+                self.assertIs(adder.add_chunked_req(req), req)
+                self.assertEqual(adder.can_run_list, [])
+                self.assertEqual(req.extend_end, prefix)
+                adder._kv_shard_reserve_scratch.assert_not_called()
+                adder._update_prefill_budget.assert_not_called()
+
+    def test_continuation_resumes_after_capacity_recovers(self):
+        req, adder = self._continuation(effective=5120, prefix=65752)
+        self.assertIs(adder.add_chunked_req(req), req)
+        adder.memory_budget.allocator.available_size = lambda: 16384
+        self.assertIsNone(adder.add_chunked_req(req))
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(req.extend_end, 73607)
+        adder._update_prefill_budget.assert_called_once()
 
 
 class TestRunningDecodeReservation(CustomTestCase):

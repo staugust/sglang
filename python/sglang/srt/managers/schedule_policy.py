@@ -1135,7 +1135,8 @@ class PrefillAdder:
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
-        if request_slot_reserve and not self.memory_budget.can_allocate_prefill(
+        # Existing request slots do not guarantee capacity for the next KV chunk.
+        if not self.memory_budget.can_allocate_prefill(
             paged_input=(
                 self.ceil_paged_tokens(new_len)
                 + self.per_req_token_overhead
